@@ -26,12 +26,11 @@
 #include <linux/uaccess.h>
 #include <linux/qpnp/qpnp-pbs.h>
 #include <linux/power_supply.h>
-
 /* status register definitions in HAPTICS_CFG module */
 #define HAP_CFG_REVISION2_REG			0x01
 #define HAP_CFG_V1				0x1
 #define HAP_CFG_V2				0x2
-
+#define DEBUG
 #define HAP_CFG_STATUS_DATA_MSB_REG		0x09
 /* STATUS_DATA_MSB definitions while MOD_STATUS_SEL is 0 */
 #define AUTO_RES_CAL_DONE_BIT			BIT(5)
@@ -125,10 +124,6 @@
 #define HAP_CFG_DRV_DUTY_CFG_REG		0x60
 #define ADT_DRV_DUTY_EN_BIT			BIT(7)
 
-#define DRV_DUTY_MASK GENMASK(5, 3)
-#define DRV_DUTY_62P5_PERCENT 0x2
-#define DRV_DUTY_SHIFT 3
-
 #define HAP_CFG_ADT_DRV_DUTY_CFG_REG		0x61
 #define HAP_CFG_ZX_WIND_CFG_REG			0x62
 
@@ -137,7 +132,6 @@
 #define AUTORES_EN_DLY_MASK			GENMASK(5, 2)
 #define AUTORES_EN_DLY(cycles)			((cycles) * 2)
 #define AUTORES_EN_DLY_6_CYCLES			AUTORES_EN_DLY(6)
-#define AUTORES_EN_DLY_7_CYCLES			AUTORES_EN_DLY(7)
 #define AUTORES_EN_DLY_SHIFT			2
 #define AUTORES_ERR_WINDOW_MASK			GENMASK(1, 0)
 #define AUTORES_ERR_WINDOW_12P5_PERCENT		0x0
@@ -495,7 +489,6 @@ struct haptics_chip {
 	struct class			hap_class;
 	struct regulator		*hpwr_vreg;
 	struct hrtimer			hbst_off_timer;
-	struct hrtimer			dph_off_timer; /*DIRECT_PLAY turning off timer*/
 #ifdef CONFIG_TARGET_PRODUCT_MAYFLY
 	struct power_supply		*wls_psy;
 #endif
@@ -1721,7 +1714,6 @@ static int haptics_get_available_fifo_memory(struct haptics_chip *chip)
 {
 	int rc;
 	u32 fill, available;
-
 #ifdef CONFIG_TARGET_PRODUCT_MAYFLY
 	if (get_wls_backcharge_enable(chip)) {
 		dev_dbg(chip->dev, "wireless backcharge enabled, skip haptics!");
@@ -1983,7 +1975,7 @@ static int haptics_set_fifo(struct haptics_chip *chip, struct fifo_cfg *fifo)
 	return 0;
 }
 
-static int haptics_load_constant_effect(struct haptics_chip *chip, u8 amplitude, u32 length_us)
+static int haptics_load_constant_effect(struct haptics_chip *chip, u8 amplitude)
 {
 	struct haptics_play_info *play = &chip->play;
 	u32 hdrm_mv, vmax_mv = chip->config.vmax_mv;
@@ -1998,10 +1990,6 @@ static int haptics_load_constant_effect(struct haptics_chip *chip, u8 amplitude,
 
 	/* No effect data when playing constant waveform */
 	play->effect = NULL;
-
-	/*set play time*/
-	play->length_us = length_us;
-	dev_dbg(chip->dev, "play->length_us is %u us", play->length_us);
 
 	/* Fix Vmax to (hpwr_vreg_mv - hdrm_mv) in non-HBOOST regulator case */
 	if (chip->hpwr_vreg) {
@@ -2123,8 +2111,6 @@ static int haptics_init_custom_effect(struct haptics_chip *chip)
 	chip->custom_effect->id = UINT_MAX;
 #ifdef CONFIG_TARGET_PRODUCT_DITING
 	chip->custom_effect->vmax_mv = 9000;
-#elif defined(CONFIG_TARGET_PRODUCT_MONDRIAN)
-	chip->custom_effect->vmax_mv = 9000;
 #elif defined(CONFIG_TARGET_PRODUCT_MAYFLY)
 	chip->custom_effect->vmax_mv = 9100;
 #else
@@ -2245,7 +2231,11 @@ static int haptics_load_custom_effect(struct haptics_chip *chip,
 
 	play->effect = chip->custom_effect;
 	play->brake = NULL;
-	play->vmax_mv = (magnitude * chip->custom_effect->vmax_mv) / 0x7fff;
+		/*
+	 * make vibration intensity could changed larger, 0x4000
+	 * is computed by 0x7fff - 0x3fff
+	 */
+	play->vmax_mv = (magnitude - 0x3fff) * chip->custom_effect->vmax_mv / 0x4000;
 	rc = haptics_set_vmax_mv(chip, play->vmax_mv);
 	if (rc < 0)
 		goto cleanup;
@@ -2416,7 +2406,6 @@ static int haptics_upload_effect(struct input_dev *dev,
 	s16 level;
 	u8 amplitude;
 	int rc = 0;
-
 #ifdef CONFIG_TARGET_PRODUCT_MAYFLY
 	if(effect->type == FF_DAMPER){
 		chip->hboost_quick_off = true;
@@ -2437,7 +2426,7 @@ static int haptics_upload_effect(struct input_dev *dev,
 		amplitude = tmp / 0x7fff;
 		dev_dbg(chip->dev, "upload constant effect, length = %dus, amplitude = %#x\n",
 				length_us, amplitude);
-		haptics_load_constant_effect(chip, amplitude, length_us);
+		haptics_load_constant_effect(chip, amplitude);
 		if (rc < 0) {
 			dev_err(chip->dev, "set direct play failed, rc=%d\n",
 					rc);
@@ -2511,7 +2500,6 @@ static int haptics_playback(struct input_dev *dev, int effect_id, int val)
 	struct haptics_chip *chip = input_get_drvdata(dev);
 	struct haptics_play_info *play = &chip->play;
 	int rc;
-
 #ifdef CONFIG_TARGET_PRODUCT_MAYFLY
 	if (get_wls_backcharge_enable(chip)) {
 		dev_dbg(chip->dev, "wireless backcharge enabled, skip haptics!");
@@ -2523,12 +2511,6 @@ static int haptics_playback(struct input_dev *dev, int effect_id, int val)
 		rc = haptics_enable_play(chip, true);
 		if (rc < 0)
 			return rc;
-		if (play->pattern_src == DIRECT_PLAY) {
-			u64 length_ns = play->length_us * NSEC_PER_USEC;
-			hrtimer_start(&chip->dph_off_timer,
-					ns_to_ktime(length_ns),
-					HRTIMER_MODE_REL);
-                }
 	} else {
 		if (play->pattern_src == FIFO &&
 				atomic_read(&play->fifo_status.is_busy)) {
@@ -2565,8 +2547,7 @@ static int haptics_erase(struct input_dev *dev, int effect_id)
 			dev_dbg(chip->dev, "cancelling FIFO playing\n");
 			atomic_set(&play->fifo_status.cancelled, 1);
 		}
-
-#if defined(CONFIG_TARGET_PRODUCT_MAYFLY) || defined(CONFIG_TARGET_PRODUCT_DITING) || defined(CONFIG_TARGET_PRODUCT_ZIZHAN) || defined(CONFIG_TARGET_PRODUCT_MONDRIAN)
+#if defined(CONFIG_TARGET_PRODUCT_MAYFLY) || defined(CONFIG_TARGET_PRODUCT_ZIZHAN)
 #define FIFO_PLAY_STOP_DELAY 9
 		msleep(FIFO_PLAY_STOP_DELAY);
 		dev_info(chip->dev, "fifo play stop delay %d ms\n", FIFO_PLAY_STOP_DELAY);
@@ -4387,22 +4368,13 @@ static int haptics_detect_lra_frequency(struct haptics_chip *chip)
 	rc = haptics_masked_write(chip, chip->cfg_addr_base,
 			HAP_CFG_AUTORES_CFG_REG, AUTORES_EN_BIT |
 			AUTORES_EN_DLY_MASK | AUTORES_ERR_WINDOW_MASK,
-#if defined(CONFIG_TARGET_PRODUCT_MONDRIAN)
-			AUTORES_EN_DLY_7_CYCLES << AUTORES_EN_DLY_SHIFT
-#else
 			AUTORES_EN_DLY_6_CYCLES << AUTORES_EN_DLY_SHIFT
-#endif
 			| AUTORES_ERR_WINDOW_50_PERCENT | AUTORES_EN_BIT);
 	if (rc < 0)
 		return rc;
 
 	rc = haptics_masked_write(chip, chip->cfg_addr_base,
-#if defined(CONFIG_TARGET_PRODUCT_MONDRIAN)
-			HAP_CFG_DRV_DUTY_CFG_REG, ADT_DRV_DUTY_EN_BIT |
-			DRV_DUTY_MASK, DRV_DUTY_62P5_PERCENT << DRV_DUTY_SHIFT);
-#else
 			HAP_CFG_DRV_DUTY_CFG_REG, ADT_DRV_DUTY_EN_BIT, 0);
-#endif
 	if (rc < 0)
 		goto restore;
 
@@ -4590,20 +4562,6 @@ static enum hrtimer_restart haptics_disable_hbst_timer(struct hrtimer *timer)
 	return HRTIMER_NORESTART;
 }
 
-static enum hrtimer_restart haptics_disable_dph_timer(struct hrtimer *timer)
-{
-	struct haptics_chip *chip = container_of(timer,
-			struct haptics_chip, dph_off_timer);
-	int rc;
-	rc = haptics_enable_play(chip, false);
-	if (rc < 0)
-		dev_err(chip->dev, "disable haptics play failed, rc =%d\n", rc);
-	else
-		dev_dbg(chip->dev, "disable direct play haptics with timer\n");
-
-	return HRTIMER_NORESTART;
-}
-
 static int haptics_probe(struct platform_device *pdev)
 {
 	struct haptics_chip *chip;
@@ -4665,8 +4623,6 @@ static int haptics_probe(struct platform_device *pdev)
 	chip->fifo_empty_irq_en = false;
 	hrtimer_init(&chip->hbst_off_timer, CLOCK_MONOTONIC, HRTIMER_MODE_REL);
 	chip->hbst_off_timer.function = haptics_disable_hbst_timer;
-	hrtimer_init(&chip->dph_off_timer, CLOCK_MONOTONIC, HRTIMER_MODE_REL);
-	chip->dph_off_timer.function = haptics_disable_dph_timer;
 
 	atomic_set(&chip->play.fifo_status.is_busy, 0);
 	atomic_set(&chip->play.fifo_status.written_done, 0);
@@ -4786,8 +4742,6 @@ static int haptics_suspend(struct device *dev)
 	rc = haptics_enable_hpwr_vreg(chip, false);
 	if (rc < 0)
 		return rc;
-
-	hrtimer_cancel(&chip->dph_off_timer);
 
 	return haptics_module_enable(chip, false);
 }
